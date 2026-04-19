@@ -89,8 +89,12 @@ def _engineer_polars(df):
     if "dep_weekday_local" in cols: bkt.append(pl.col("dep_weekday_local").is_in([6,7]).cast(pl.Int8).alias("is_weekend"))
     if "flight_date" in cols:
         print("  [eng] holiday features …")
+        # Ensure flight_date is pl.Date regardless of source type
+        if df["flight_date"].dtype != pl.Date:
+            df = df.with_columns(pl.col("flight_date").cast(pl.Date))
+            cols = set(df.columns)
         bkt.append(pl.col("flight_date").cast(pl.Utf8).is_in(list(_HOLIDAY_SET)).cast(pl.Int8).alias("is_holiday"))
-        bkt.append(pl.min_horizontal([(pl.col("flight_date")-pl.lit(h)).dt.total_days().abs() for h in _HOLIDAY_DATES]).cast(pl.Int32).alias("days_to_nearest_holiday"))
+        bkt.append(pl.min_horizontal([(pl.col("flight_date").cast(pl.Date)-pl.lit(h)).dt.total_days().abs() for h in _HOLIDAY_DATES]).cast(pl.Int32).alias("days_to_nearest_holiday"))
     if bkt: df=df.with_columns(bkt); cols=set(df.columns)
     # Traffic
     print("  [eng] traffic volumes …")
@@ -156,7 +160,8 @@ def load_and_engineer(parquet_path, cache_suffix="_cache", models_dir=None):
     src=Path(parquet_path); cache=src.with_name(src.stem+cache_suffix+".parquet")
     if cache.exists() and cache.stat().st_mtime>=src.stat().st_mtime:
         print(f"[cache] Reading {cache.name} …")
-        df_pd=pl.read_parquet(cache).to_pandas()
+        import pyarrow.parquet as pq
+        df_pd = pq.read_table(str(cache)).to_pandas(timestamp_as_object=False)
         print(f"[cache] {len(df_pd):,} rows · {df_pd.shape[1]} cols ready.")
         return df_pd
     print(f"[cache] Processing {src.name} with Polars …")
@@ -192,37 +197,39 @@ class FlightIndex:
     def __init__(self,df):
         self._df=df
         print("[index] Building tail-number index …")
-        self.tail_index={}
+        self.tail_index: dict[str, "np.ndarray"] = {}
         if "tail_number" in df.columns:
+            _tmp: dict[str, list] = {}
             for pos,val in enumerate(df["tail_number"].astype(str).str.upper()):
-                self.tail_index.setdefault(val,[]).append(pos)
+                _tmp.setdefault(val,[]).append(pos)
+            self.tail_index = {k: np.array(v, dtype=np.int32) for k,v in _tmp.items()}
+            del _tmp
         print("[index] Building flight-number index …")
-        self.flight_index={}
+        self.flight_index: dict[str, "np.ndarray"] = {}
         for col in ("flight_number_reporting_airline","flight_number","fl_num","op_carrier_fl_num"):
             if col in df.columns:
                 print(f"[index] Flight number column: '{col}'")
+                _tmp2: dict[str, list] = {}
                 for pos,val in enumerate(df[col].astype(str).str.strip()):
-                    self.flight_index.setdefault(val,[]).append(pos)
+                    _tmp2.setdefault(val,[]).append(pos)
                     s=val.lstrip("0")
-                    if s and s!=val: self.flight_index.setdefault(s,[]).append(pos)
+                    if s and s!=val: _tmp2.setdefault(s,[]).append(pos)
+                self.flight_index = {k: np.array(v, dtype=np.int32) for k,v in _tmp2.items()}
+                del _tmp2
                 break
-        print("[index] Building flight-id index …")
-        self.flight_id_index={}
-        if "flight_id" in df.columns:
-            for pos,val in enumerate(df["flight_id"].astype(str)):
-                self.flight_id_index[val]=pos
-        print(f"[index] {len(self.tail_index):,} tails | {len(self.flight_index):,} flight numbers | {len(self.flight_id_index):,} flight IDs — ready.")
+        print(f"[index] {len(self.tail_index):,} tails | {len(self.flight_index):,} flight numbers — ready.")
 
     def search(self,tail_number=None,date=None,flight_number=None,origin=None,dest=None):
         df=self._df
         if tail_number:
-            pos=self.tail_index.get(tail_number.strip().upper(),[])
-            if not pos: return pd.DataFrame()
+            pos=self.tail_index.get(tail_number.strip().upper(),np.array([],dtype=np.int32))
+            if len(pos)==0: return pd.DataFrame()
             sub=df.iloc[pos].copy()
         elif flight_number:
             raw=str(flight_number).strip().split()[-1]
-            pos=self.flight_index.get(raw) or self.flight_index.get(raw.lstrip("0")) or []
-            if not pos: return pd.DataFrame()
+            _p1=self.flight_index.get(raw,None); _p2=self.flight_index.get(raw.lstrip("0"),None)
+            pos = _p1 if (_p1 is not None and len(_p1)>0) else _p2
+            if pos is None or len(pos)==0: return pd.DataFrame()
             sub=df.iloc[pos].copy()
         else: return pd.DataFrame()
         if date:
@@ -239,14 +246,20 @@ class FlightIndex:
         p_dest=str(row.get("prev_dest","")   or "")
         if p_orig and p_orig not in ("nan","None",""):
             out["prev1_origin"]=p_orig; out["prev1_dest"]=p_dest
-            prev_fid=str(row.get("prev_flight_id_same_tail","") or "")
-            if prev_fid and prev_fid not in ("nan","None",""):
-                fid_pos=self.flight_id_index.get(prev_fid)
-                if fid_pos is not None:
-                    pr=self._df.iloc[fid_pos]
-                    p2o=str(pr.get("prev_origin","") or "")
-                    p2d=str(pr.get("prev_dest","")   or "")
-                    if p2o not in ("nan","None",""): out["prev2_origin"]=p2o; out["prev2_dest"]=p2d
+            # prev2: look up prev1 row via tail index to get its prev_origin
+            tail   = str(row.get("tail_number","")).upper()
+            dep_ts = row.get("dep_ts_actual_utc")
+            if tail and not pd.isna(dep_ts):
+                pos = self.tail_index.get(tail,[])
+                if len(pos) >= 2:
+                    tdf = self._df.iloc[pos]
+                    if "dep_ts_actual_utc" in tdf.columns:
+                        bef = tdf[tdf["dep_ts_actual_utc"] < dep_ts]
+                        if len(bef) >= 1:
+                            prev1_row = bef.iloc[-1]
+                            p2o = str(prev1_row.get("prev_origin","") or "")
+                            p2d = str(prev1_row.get("prev_dest","")   or "")
+                            if p2o not in ("nan","None",""): out["prev2_origin"]=p2o; out["prev2_dest"]=p2d
             return out
         tail=str(row.get("tail_number","")).upper(); dep_ts=row.get("dep_ts_actual_utc")
         if not tail or pd.isna(dep_ts): return out
