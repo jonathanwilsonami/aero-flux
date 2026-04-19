@@ -169,8 +169,19 @@ def load_and_engineer(parquet_path, cache_suffix="_cache", models_dir=None) -> p
     """
     Returns a Polars DataFrame kept in Arrow memory (~800 MB).
     Never converts to pandas — that would expand to ~3 GB and OOM.
+
+    If the raw source parquet doesn't exist but the cache does,
+    reads the cache directly — no engineering needed.
     """
     src=Path(parquet_path); cache=src.with_name(src.stem+cache_suffix+".parquet")
+
+    # Cache-only mode: source absent but cache present — just read it
+    if not src.exists() and cache.exists():
+        print(f"[cache] Source not found — reading existing {cache.name} …")
+        df=pl.read_parquet(cache)
+        print(f"[cache] {df.height:,} rows · {df.width} cols · ~{df.estimated_size('mb'):.0f} MB in RAM")
+        return df
+
     if cache.exists() and cache.stat().st_mtime>=src.stat().st_mtime:
         print(f"[cache] Reading {cache.name} …")
         df=pl.read_parquet(cache)
