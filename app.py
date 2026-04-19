@@ -15,6 +15,7 @@ from pathlib import Path
 import dash
 import dash_bootstrap_components as dbc
 import pandas as pd
+import polars as pl
 from dash import Input, Output, State, dcc, html
 
 from charts import actual_vs_predicted, feature_contributions, propagation_chain, route_map
@@ -33,42 +34,15 @@ MODELS_DIR = ROOT / "models"
 DATA_FILE  = ROOT / "data" / "flights_canonical_2019.parquet"
 DEFAULT_THRESHOLD = 0.5
 
-S3_BUCKET   = "or568-flight-delay-data-411750981882-us-east-1-an"
-S3_DATA_KEY = "flights_canonical_2019.parquet"
-S3_MODELS   = [
-    "models/xgb_classifier_xgb_full.joblib",
-    "models/xgb_regressor_xgb_full.joblib",
-]
-
 # ---------------------------------------------------------------------------
 # Startup:  load data  →  build index  (runs once, before any request)
 # ---------------------------------------------------------------------------
 
-def _download_from_s3() -> None:
-    import boto3
-    s3 = boto3.client("s3")
-
-    # Download parquet if not already cached locally
-    if not DATA_FILE.exists():
-        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[s3] Downloading {S3_DATA_KEY} …")
-        s3.download_file(S3_BUCKET, S3_DATA_KEY, str(DATA_FILE))
-        print("[s3] Download complete.")
-
-    # Download model files
-    for key in S3_MODELS:
-        local = ROOT / key
-        if not local.exists():
-            local.parent.mkdir(parents=True, exist_ok=True)
-            print(f"[s3] Downloading {key} …")
-            s3.download_file(S3_BUCKET, key, str(local))
-
-_DF:    pd.DataFrame | None = None
+_DF:    "pl.DataFrame | None" = None
 _INDEX: FlightIndex  | None = None
 _LOAD_ERROR: str = ""
 
 def _startup() -> None:
-    _download_from_s3()
     global _DF, _INDEX, _LOAD_ERROR
     if not DATA_FILE.exists():
         _LOAD_ERROR = f"Data file not found: {DATA_FILE}"
@@ -123,7 +97,7 @@ def _sidebar() -> dbc.Col:
         banner = dbc.Alert("No data file.", color="warning", className="p-2 mb-3")
     else:
         banner = dbc.Alert(
-            [html.B(f"✓ {len(_DF):,} flights  "),
+            [html.B(f"✓ {_DF.height:,} flights  "),
              html.Span(DATA_FILE.name, className="small text-muted")],
             color="success", className="p-2 mb-3")
 
@@ -226,7 +200,7 @@ app.layout = dbc.Container([
                 className="fw-bold mt-4 mb-1"),
         html.P(
             f"{DATA_FILE.name}  ·  "
-            + (f"{len(_DF):,} flights ready" if _DF is not None else "data not loaded")
+            + (f"{_DF.height:,} flights ready" if _DF is not None else "data not loaded")
             + f"  ·  {n_models} model{'s' if n_models != 1 else ''} available",
             className="text-muted small mb-4",
         ),

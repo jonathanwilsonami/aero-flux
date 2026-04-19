@@ -1,7 +1,17 @@
 """
 data.py — AeroFlux
-Uses Polars for loading and feature engineering (memory efficient),
-converts to slim pandas DataFrame only at the end.
+─────────────────
+Memory strategy
+  • Engineering: Polars
+  • Cache write: Polars parquet (snappy)
+  • In-memory store: Polars DataFrame (~800 MB for 7M rows × 63 cols)
+  • Index values: numpy int32 arrays (~58 MB total)
+  • Row returned to app: pandas Series (single row, trivial)
+
+Why Polars in-memory instead of pandas?
+  pandas expands the 761 MB parquet to ~3 GB in RAM (object dtypes,
+  numpy overhead). Polars keeps the same data as Arrow columnar memory
+  at ~800 MB — a 3.7x saving that keeps the 4 GB instance stable.
 """
 from __future__ import annotations
 import re, warnings
@@ -58,12 +68,10 @@ _IDENTITY_COLS = [
     "dep_temp_c","dep_wind_speed_m_s","dep_ceiling_height_m",
 ]
 
-def _clean_col(col):
-    col = re.sub(r"[^0-9a-zA-Z]+","_",col)
-    col = re.sub(r"([A-Z]+)([A-Z][a-z])",r"\1_\2",col)
-    col = re.sub(r"([a-z0-9])([A-Z])",r"\1_\2",col)
-    col = re.sub(r"_+","_",col)
-    return col.strip("_").lower()
+def _clean_col(c):
+    c=re.sub(r"[^0-9a-zA-Z]+","_",c); c=re.sub(r"([A-Z]+)([A-Z][a-z])",r"\1_\2",c)
+    c=re.sub(r"([a-z0-9])([A-Z])",r"\1_\2",c); c=re.sub(r"_+","_",c)
+    return c.strip("_").lower()
 
 def _parse_date(s):
     for fmt in ("%Y-%m-%d","%m/%d/%Y","%m-%d-%Y","%d/%m/%Y"):
@@ -72,10 +80,16 @@ def _parse_date(s):
     try: return pd.to_datetime(s).date()
     except: return None
 
+def _row_to_series(row: pl.DataFrame) -> pd.Series:
+    """Convert a 1-row Polars DataFrame to a pandas Series for prediction."""
+    return row.to_pandas().iloc[0]
+
+# ---------------------------------------------------------------------------
+# Polars engineering (unchanged)
+# ---------------------------------------------------------------------------
 def _engineer_polars(df):
     print(f"  [eng] {df.height:,} rows — Polars engineering …")
-    cols = set(df.columns)
-    # Calendar
+    cols=set(df.columns)
     cal=[]
     if "dep_ts_actual_utc" in cols:
         if "dep_hour_local"    not in cols: cal.append(pl.col("dep_ts_actual_utc").dt.hour().cast(pl.Int8).alias("dep_hour_local"))
@@ -89,14 +103,11 @@ def _engineer_polars(df):
     if "dep_weekday_local" in cols: bkt.append(pl.col("dep_weekday_local").is_in([6,7]).cast(pl.Int8).alias("is_weekend"))
     if "flight_date" in cols:
         print("  [eng] holiday features …")
-        # Ensure flight_date is pl.Date regardless of source type
         if df["flight_date"].dtype != pl.Date:
-            df = df.with_columns(pl.col("flight_date").cast(pl.Date))
-            cols = set(df.columns)
+            df=df.with_columns(pl.col("flight_date").cast(pl.Date)); cols=set(df.columns)
         bkt.append(pl.col("flight_date").cast(pl.Utf8).is_in(list(_HOLIDAY_SET)).cast(pl.Int8).alias("is_holiday"))
         bkt.append(pl.min_horizontal([(pl.col("flight_date").cast(pl.Date)-pl.lit(h)).dt.total_days().abs() for h in _HOLIDAY_DATES]).cast(pl.Int32).alias("days_to_nearest_holiday"))
     if bkt: df=df.with_columns(bkt); cols=set(df.columns)
-    # Traffic
     print("  [eng] traffic volumes …")
     if "origin" in cols and "dest" in cols:
         if "route_key" not in cols: df=df.with_columns((pl.col("origin")+"_"+pl.col("dest")).alias("route_key")); cols.add("route_key")
@@ -105,10 +116,8 @@ def _engineer_polars(df):
         if "origin_flight_volume" not in cols: vol.append(pl.col("origin").count().over("origin").alias("origin_flight_volume"))
         if "dest_flight_volume"   not in cols: vol.append(pl.col("dest").count().over("dest").alias("dest_flight_volume"))
         if vol: df=df.with_columns(vol); cols=set(df.columns)
-    # Sort
     sb=[c for c in ("tail_number","dep_ts_actual_utc") if c in cols]
     if sb: print("  [eng] sorting …"); df=df.sort(sb)
-    # Lags
     print("  [eng] lag features …")
     lag=[]
     for src,dst,n in [("arr_delay","prev_arr_delay",1),("dep_delay","prev_dep_delay",1),("arr_del15","prev_arr_del15",1),("dep_del15","prev_dep_del15",1),
@@ -121,7 +130,6 @@ def _engineer_polars(df):
     if "prev_arr_delay" in cols and "prev_arr_delayed_flag" not in cols: drv.append((pl.col("prev_arr_delay").fill_null(0)>15).cast(pl.Int8).alias("prev_arr_delayed_flag"))
     if "prev_arr_delay" in cols and "prev_dep_delay" in cols and "prev_total_delay" not in cols: drv.append((pl.col("prev_arr_delay").fill_null(0)+pl.col("prev_dep_delay").fill_null(0)).alias("prev_total_delay"))
     if drv: df=df.with_columns(drv); cols=set(df.columns)
-    # Turnaround
     if "dep_ts_actual_utc" in cols and "arr_ts_actual_utc" in cols:
         print("  [eng] turnaround …")
         ta=[]
@@ -129,7 +137,6 @@ def _engineer_polars(df):
         if "turnaround_minutes"       not in cols: ta.append((pl.col("dep_ts_actual_utc")-pl.col("arr_ts_actual_utc").shift(1).over("tail_number")).dt.total_minutes().cast(pl.Float32).alias("turnaround_minutes"))
         if "time_since_prev2_arrival_minutes" not in cols: ta.append((pl.col("dep_ts_actual_utc")-pl.col("arr_ts_actual_utc").shift(2).over("tail_number")).dt.total_minutes().cast(pl.Float32).alias("time_since_prev2_arrival_minutes"))
         if ta: df=df.with_columns(ta); cols=set(df.columns)
-    # Day stats
     if "tail_number" in cols and "flight_date" in cols:
         print("  [eng] per-aircraft-day stats …")
         dy=[]
@@ -137,11 +144,10 @@ def _engineer_polars(df):
         if "cum_dep_delay_aircraft_day" not in cols and "dep_delay" in cols: dy.append(pl.col("dep_delay").cum_sum().over(["tail_number","flight_date"]).shift(1).fill_null(0).cast(pl.Float32).alias("cum_dep_delay_aircraft_day"))
         if "cum_arr_delay_aircraft_day" not in cols and "arr_delay" in cols: dy.append(pl.col("arr_delay").cum_sum().over(["tail_number","flight_date"]).shift(1).fill_null(0).cast(pl.Float32).alias("cum_arr_delay_aircraft_day"))
         if dy: df=df.with_columns(dy); cols=set(df.columns)
-    # Flags
     fl=[]
-    if "turnaround_minutes"       in cols and "tight_turnaround_flag"    not in cols: fl.append((pl.col("turnaround_minutes").fill_null(999)<60).cast(pl.Int8).alias("tight_turnaround_flag"))
-    if "aircraft_leg_number_day"  in cols and "relative_leg_position"    not in cols: fl.append((pl.col("aircraft_leg_number_day").cast(pl.Float32)/pl.col("aircraft_leg_number_day").max().over("tail_number").cast(pl.Float32).replace(0,1)).alias("relative_leg_position"))
-    if "prev_arr_delay"           in cols and "rotation_continuity_flag" not in cols: fl.append((pl.col("prev_arr_delay").fill_null(0)<60).cast(pl.Int8).alias("rotation_continuity_flag"))
+    if "turnaround_minutes"      in cols and "tight_turnaround_flag"    not in cols: fl.append((pl.col("turnaround_minutes").fill_null(999)<60).cast(pl.Int8).alias("tight_turnaround_flag"))
+    if "aircraft_leg_number_day" in cols and "relative_leg_position"    not in cols: fl.append((pl.col("aircraft_leg_number_day").cast(pl.Float32)/pl.col("aircraft_leg_number_day").max().over("tail_number").cast(pl.Float32).replace(0,1)).alias("relative_leg_position"))
+    if "prev_arr_delay"          in cols and "rotation_continuity_flag" not in cols: fl.append((pl.col("prev_arr_delay").fill_null(0)<60).cast(pl.Int8).alias("rotation_continuity_flag"))
     if fl: df=df.with_columns(fl)
     print("  [eng] done.")
     return df
@@ -156,14 +162,20 @@ def collect_all_model_features(models_dir):
         except Exception as e: print(f"  [features] Could not read {p.name}: {e}")
     return sorted(all_f)
 
-def load_and_engineer(parquet_path, cache_suffix="_cache", models_dir=None):
+# ---------------------------------------------------------------------------
+# Public loader — returns Polars DataFrame (not pandas)
+# ---------------------------------------------------------------------------
+def load_and_engineer(parquet_path, cache_suffix="_cache", models_dir=None) -> pl.DataFrame:
+    """
+    Returns a Polars DataFrame kept in Arrow memory (~800 MB).
+    Never converts to pandas — that would expand to ~3 GB and OOM.
+    """
     src=Path(parquet_path); cache=src.with_name(src.stem+cache_suffix+".parquet")
     if cache.exists() and cache.stat().st_mtime>=src.stat().st_mtime:
         print(f"[cache] Reading {cache.name} …")
-        import pyarrow.parquet as pq
-        df_pd = pq.read_table(str(cache)).to_pandas(timestamp_as_object=False)
-        print(f"[cache] {len(df_pd):,} rows · {df_pd.shape[1]} cols ready.")
-        return df_pd
+        df=pl.read_parquet(cache)
+        print(f"[cache] {df.height:,} rows · {df.width} cols · ~{df.estimated_size('mb'):.0f} MB in RAM")
+        return df
     print(f"[cache] Processing {src.name} with Polars …")
     df=pl.read_parquet(src)
     print(f"[raw]   {df.height:,} rows × {df.width} cols")
@@ -191,88 +203,105 @@ def load_and_engineer(parquet_path, cache_suffix="_cache", models_dir=None):
     print(f"[cache] Writing {cache.name} …")
     df.write_parquet(cache,compression="snappy")
     print(f"[cache] Written ({cache.stat().st_size/1e6:.0f} MB) — {df.height:,} rows × {df.width} cols.")
-    return df.to_pandas()
+    return df
 
+# ---------------------------------------------------------------------------
+# FlightIndex — builds on Polars, returns pandas Series per row
+# ---------------------------------------------------------------------------
 class FlightIndex:
-    def __init__(self,df):
-        self._df=df
+    def __init__(self, df: pl.DataFrame) -> None:
+        self._df = df   # Polars — stays in Arrow memory
+
         print("[index] Building tail-number index …")
-        self.tail_index: dict[str, "np.ndarray"] = {}
+        self.tail_index: dict[str, np.ndarray] = {}
         if "tail_number" in df.columns:
             _tmp: dict[str, list] = {}
-            for pos,val in enumerate(df["tail_number"].astype(str).str.upper()):
-                _tmp.setdefault(val,[]).append(pos)
+            for pos, val in enumerate(df["tail_number"].cast(pl.Utf8).to_list()):
+                _tmp.setdefault((val or "").upper(), []).append(pos)
             self.tail_index = {k: np.array(v, dtype=np.int32) for k,v in _tmp.items()}
             del _tmp
+
         print("[index] Building flight-number index …")
-        self.flight_index: dict[str, "np.ndarray"] = {}
+        self.flight_index: dict[str, np.ndarray] = {}
         for col in ("flight_number_reporting_airline","flight_number","fl_num","op_carrier_fl_num"):
             if col in df.columns:
                 print(f"[index] Flight number column: '{col}'")
                 _tmp2: dict[str, list] = {}
-                for pos,val in enumerate(df[col].astype(str).str.strip()):
-                    _tmp2.setdefault(val,[]).append(pos)
-                    s=val.lstrip("0")
-                    if s and s!=val: _tmp2.setdefault(s,[]).append(pos)
+                for pos, val in enumerate(df[col].cast(pl.Utf8).to_list()):
+                    v = (val or "").strip()
+                    _tmp2.setdefault(v, []).append(pos)
+                    s = v.lstrip("0")
+                    if s and s != v: _tmp2.setdefault(s, []).append(pos)
                 self.flight_index = {k: np.array(v, dtype=np.int32) for k,v in _tmp2.items()}
                 del _tmp2
                 break
+
         print(f"[index] {len(self.tail_index):,} tails | {len(self.flight_index):,} flight numbers — ready.")
 
-    def search(self,tail_number=None,date=None,flight_number=None,origin=None,dest=None):
-        df=self._df
+    def _rows_to_df(self, positions: np.ndarray) -> pd.DataFrame:
+        """Fetch rows by position from Polars and return as pandas DataFrame."""
+        return self._df[positions.tolist()].to_pandas()
+
+    def search(self, tail_number=None, date=None, flight_number=None, origin=None, dest=None) -> pd.DataFrame:
         if tail_number:
-            pos=self.tail_index.get(tail_number.strip().upper(),np.array([],dtype=np.int32))
-            if len(pos)==0: return pd.DataFrame()
-            sub=df.iloc[pos].copy()
+            pos = self.tail_index.get(tail_number.strip().upper(), np.array([], dtype=np.int32))
+            if len(pos) == 0: return pd.DataFrame()
+            sub = self._rows_to_df(pos)
         elif flight_number:
-            raw=str(flight_number).strip().split()[-1]
-            _p1=self.flight_index.get(raw,None); _p2=self.flight_index.get(raw.lstrip("0"),None)
-            pos = _p1 if (_p1 is not None and len(_p1)>0) else _p2
-            if pos is None or len(pos)==0: return pd.DataFrame()
-            sub=df.iloc[pos].copy()
-        else: return pd.DataFrame()
+            raw = str(flight_number).strip().split()[-1]
+            _p1 = self.flight_index.get(raw, None)
+            _p2 = self.flight_index.get(raw.lstrip("0"), None)
+            pos  = _p1 if (_p1 is not None and len(_p1) > 0) else _p2
+            if pos is None or len(pos) == 0: return pd.DataFrame()
+            sub = self._rows_to_df(pos)
+        else:
+            return pd.DataFrame()
+
         if date:
-            d=_parse_date(date)
+            d = _parse_date(date)
             if d is not None and "flight_date" in sub.columns:
-                sub=sub[sub["flight_date"].apply(lambda x:x.date() if hasattr(x,"date") else x)==d]
-        if origin: sub=sub[sub["origin"].str.upper()==origin.strip().upper()]
-        if dest:   sub=sub[sub["dest"].str.upper()==dest.strip().upper()]
+                sub = sub[sub["flight_date"].apply(lambda x: x.date() if hasattr(x,"date") else x) == d]
+        if origin: sub = sub[sub["origin"].str.upper() == origin.strip().upper()]
+        if dest:   sub = sub[sub["dest"].str.upper()   == dest.strip().upper()]
         return sub.reset_index(drop=True)
 
-    def get_chain(self,row):
-        out={"prev2_origin":"","prev2_dest":"","prev1_origin":"","prev1_dest":""}
-        p_orig=str(row.get("prev_origin","") or "")
-        p_dest=str(row.get("prev_dest","")   or "")
+    def get_chain(self, row: pd.Series) -> dict:
+        out = {"prev2_origin":"","prev2_dest":"","prev1_origin":"","prev1_dest":""}
+        p_orig = str(row.get("prev_origin","") or "")
+        p_dest = str(row.get("prev_dest","")   or "")
         if p_orig and p_orig not in ("nan","None",""):
-            out["prev1_origin"]=p_orig; out["prev1_dest"]=p_dest
-            # prev2: look up prev1 row via tail index to get its prev_origin
+            out["prev1_origin"] = p_orig; out["prev1_dest"] = p_dest
             tail   = str(row.get("tail_number","")).upper()
             dep_ts = row.get("dep_ts_actual_utc")
-            if tail and not pd.isna(dep_ts):
-                pos = self.tail_index.get(tail,[])
+            if tail and pd.notna(dep_ts):
+                pos = self.tail_index.get(tail, np.array([], dtype=np.int32))
                 if len(pos) >= 2:
-                    tdf = self._df.iloc[pos]
+                    tdf = self._rows_to_df(pos)
                     if "dep_ts_actual_utc" in tdf.columns:
                         bef = tdf[tdf["dep_ts_actual_utc"] < dep_ts]
                         if len(bef) >= 1:
-                            prev1_row = bef.iloc[-1]
-                            p2o = str(prev1_row.get("prev_origin","") or "")
-                            p2d = str(prev1_row.get("prev_dest","")   or "")
+                            pr  = bef.iloc[-1]
+                            p2o = str(pr.get("prev_origin","") or "")
+                            p2d = str(pr.get("prev_dest","")   or "")
                             if p2o not in ("nan","None",""): out["prev2_origin"]=p2o; out["prev2_dest"]=p2d
             return out
-        tail=str(row.get("tail_number","")).upper(); dep_ts=row.get("dep_ts_actual_utc")
+        tail   = str(row.get("tail_number","")).upper()
+        dep_ts = row.get("dep_ts_actual_utc")
         if not tail or pd.isna(dep_ts): return out
-        pos=self.tail_index.get(tail,[])
-        if len(pos)<2: return out
-        tdf=self._df.iloc[pos]
+        pos = self.tail_index.get(tail, np.array([], dtype=np.int32))
+        if len(pos) < 2: return out
+        tdf = self._rows_to_df(pos)
         if "dep_ts_actual_utc" not in tdf.columns: return out
-        bef=tdf[tdf["dep_ts_actual_utc"]<dep_ts]
-        if len(bef)>=1: p1=bef.iloc[-1]; out["prev1_origin"]=str(p1.get("origin","")); out["prev1_dest"]=str(p1.get("dest",""))
-        if len(bef)>=2: p2=bef.iloc[-2]; out["prev2_origin"]=str(p2.get("origin","")); out["prev2_dest"]=str(p2.get("dest",""))
+        bef = tdf[tdf["dep_ts_actual_utc"] < dep_ts]
+        if len(bef) >= 1: p1=bef.iloc[-1]; out["prev1_origin"]=str(p1.get("origin","")); out["prev1_dest"]=str(p1.get("dest",""))
+        if len(bef) >= 2: p2=bef.iloc[-2]; out["prev2_origin"]=str(p2.get("origin","")); out["prev2_dest"]=str(p2.get("dest",""))
         return out
 
+# ---------------------------------------------------------------------------
+# Legacy wrappers
+# ---------------------------------------------------------------------------
 def find_flight(df,flight_id=None,tail_number=None,origin=None,dest=None):
+    if isinstance(df, pl.DataFrame): df = df.to_pandas()
     r=df
     if flight_id:
         fid=str(flight_id).strip().upper()
@@ -289,6 +318,7 @@ def find_flight(df,flight_id=None,tail_number=None,origin=None,dest=None):
     return r.reset_index(drop=True)
 
 def get_propagation_chain(df,row):
+    if isinstance(df, pl.DataFrame): df = df.to_pandas()
     chain={"prev2_origin":"","prev2_dest":"","prev1_origin":"","prev1_dest":""}
     if "tail_number" not in df.columns or "dep_ts_actual_utc" not in df.columns: return chain
     tail=row.get("tail_number",""); dep_ts=row.get("dep_ts_actual_utc")
