@@ -31,7 +31,7 @@ from models.loader import discover_models, get_feature_names, load_model_pair, p
 
 ROOT       = Path(__file__).parent
 MODELS_DIR = ROOT / "models"
-DATA_FILE  = ROOT / "data" / "flights_canonical_2019.parquet"
+DATA_FILE  = ROOT / "data" / "flights_canonical_2019_cache.parquet"
 DEFAULT_THRESHOLD = 0.5
 
 # ---------------------------------------------------------------------------
