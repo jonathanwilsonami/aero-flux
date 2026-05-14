@@ -1,9 +1,12 @@
 """
 app.py  —  Flight delay model production demo
 
-Search modes:
-  • Tail number  +  date       (e.g. N215NV  +  2019-03-14)
-  • Flight number [+ date / origin / dest]   (e.g. 1294)
+Search modes (cascading dropdowns):
+  • Tail number  → Date → Origin → Destination
+  • Flight number → Date → Origin → Destination
+
+Each downstream dropdown narrows to only valid combinations given the
+upstream selection — so a demo run is just three clicks and "Run".
 
 Run:  python app.py   →   http://localhost:8050
 """
@@ -16,7 +19,7 @@ import dash
 import dash_bootstrap_components as dbc
 import pandas as pd
 import polars as pl
-from dash import Input, Output, State, dcc, html
+from dash import Input, Output, State, dcc, html, callback_context, no_update
 
 from charts import actual_vs_predicted, feature_contributions, propagation_chain, route_map
 from data import (
@@ -31,11 +34,20 @@ from models.loader import discover_models, get_feature_names, load_model_pair, p
 
 ROOT       = Path(__file__).parent
 MODELS_DIR = ROOT / "models"
-DATA_FILE  = ROOT / "data" / "flights_canonical_2019_cache.parquet"
+
+# Try both common filename conventions so this works whether the user has the
+# raw source or just the cache file in data/.
+_CANDIDATES = [
+    ROOT / "data" / "flights_canonical_2019.parquet",        # raw source
+    ROOT / "data" / "flights_canonical_2019_cache.parquet",  # pre-built cache
+]
+DATA_FILE = next((p for p in _CANDIDATES if p.exists()), _CANDIDATES[0])
+
 DEFAULT_THRESHOLD = 0.5
+FILTER_MONTH      = 11   # ← November only
 
 # ---------------------------------------------------------------------------
-# Startup:  load data  →  build index  (runs once, before any request)
+# Startup:  load data  →  build index
 # ---------------------------------------------------------------------------
 
 _DF:    "pl.DataFrame | None" = None
@@ -45,12 +57,19 @@ _LOAD_ERROR: str = ""
 def _startup() -> None:
     global _DF, _INDEX, _LOAD_ERROR
     if not DATA_FILE.exists():
-        _LOAD_ERROR = f"Data file not found: {DATA_FILE}"
+        _LOAD_ERROR = (
+            f"Data file not found. Looked for:\n"
+            + "\n".join(f"  • {p}" for p in _CANDIDATES)
+        )
         print(f"[WARN] {_LOAD_ERROR}")
         return
     try:
-        _DF    = load_and_engineer(DATA_FILE, models_dir=MODELS_DIR)  # cache-aware
-        _INDEX = FlightIndex(_DF)                      # O(1) lookup index
+        _DF    = load_and_engineer(
+            DATA_FILE,
+            models_dir=MODELS_DIR,
+            filter_month=FILTER_MONTH,
+        )
+        _INDEX = FlightIndex(_DF)
     except Exception as exc:
         _LOAD_ERROR = str(exc)
         print(f"[ERROR] {_LOAD_ERROR}\n{traceback.format_exc()}")
@@ -67,7 +86,7 @@ app = dash.Dash(
     title="Flight delay demo",
     suppress_callback_exceptions=True,
 )
-server = app.server   # exposed for gunicorn / production deployment
+server = app.server
 
 # ---------------------------------------------------------------------------
 # UI helpers
@@ -79,101 +98,116 @@ def _lbl(text: str) -> html.Label:
 def _field(label: str, ctrl, md: int = 12) -> dbc.Col:
     return dbc.Col([_lbl(label), ctrl], md=md, className="mb-3")
 
-def _sel(id_: str, opts, val=None) -> dcc.Dropdown:
-    return dcc.Dropdown(id=id_, options=opts, value=val, clearable=False,
-                        style={"fontSize": "13px"})
+def _opts(values: list[str]) -> list[dict]:
+    return [{"label": str(v), "value": str(v)} for v in values if v not in (None, "", "nan")]
+
+def _dd(id_: str, opts=None, val=None, placeholder="Select…", clearable=True) -> dcc.Dropdown:
+    return dcc.Dropdown(
+        id=id_, options=opts or [], value=val,
+        placeholder=placeholder, clearable=clearable,
+        style={"fontSize": "13px"},
+        optionHeight=32,
+    )
+
+# ---------------------------------------------------------------------------
+# Pre-compute initial dropdown options
+# ---------------------------------------------------------------------------
+
+if _INDEX is not None:
+    INITIAL_TAILS    = _INDEX.all_tails()
+    INITIAL_FNUMS    = _INDEX.all_flight_numbers()
+    INITIAL_ORIGINS  = _INDEX._distinct("origin")
+    INITIAL_DESTS    = _INDEX._distinct("dest")
+    INITIAL_DATES    = _INDEX._all_dates(limit=500)
+else:
+    INITIAL_TAILS = INITIAL_FNUMS = INITIAL_ORIGINS = INITIAL_DESTS = INITIAL_DATES = []
 
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 
 def _sidebar() -> dbc.Col:
-    # Data status banner
     if _LOAD_ERROR:
-        banner = dbc.Alert([html.B("Data not loaded  "), html.Br(),
-                            html.Span(_LOAD_ERROR, className="small")],
-                           color="danger", className="p-2 mb-3")
+        banner = dbc.Alert(
+            [html.B("Data not loaded  "), html.Br(),
+             html.Pre(_LOAD_ERROR, className="small mb-0", style={"whiteSpace": "pre-wrap"})],
+            color="danger", className="p-2 mb-3")
     elif _DF is None:
         banner = dbc.Alert("No data file.", color="warning", className="p-2 mb-3")
     else:
         banner = dbc.Alert(
-            [html.B(f"✓ {_DF.height:,} flights  "),
-             html.Span(DATA_FILE.name, className="small text-muted")],
+            [html.B(f"✓ {_DF.height:,} flights loaded  "), html.Br(),
+             html.Span(f"{DATA_FILE.name}  ·  Nov only  ·  "
+                       f"{len(INITIAL_TAILS):,} tails · {len(INITIAL_FNUMS):,} flight #s",
+                       className="small text-muted")],
             color="success", className="p-2 mb-3")
 
-    # Model dropdown
     models_found = discover_models(MODELS_DIR)
     model_opts   = ([{"label": n, "value": n} for n in models_found]
                     if models_found else
-                    [{"label": "No .joblib models found", "value": "__none__"}])
+                    [{"label": "No models found", "value": "__none__"}])
 
     return dbc.Col([
         banner,
 
-        # ── Search ────────────────────────────────────────────────────
         dbc.Card([
             dbc.CardHeader(html.B("Flight search")),
             dbc.CardBody([
 
-                # Mode tabs
                 dbc.Tabs([
                     dbc.Tab(label="Tail + date", tab_id="tab-tail"),
                     dbc.Tab(label="Flight number", tab_id="tab-fnum"),
-                ], id="search-tabs", active_tab="tab-tail",
-                   className="mb-3"),
+                ], id="search-tabs", active_tab="tab-tail", className="mb-3"),
 
-                # Tail + date panel
+                # Tail mode panel
                 html.Div(id="panel-tail", children=[
                     dbc.Row([
                         _field("Tail number",
-                               dbc.Input(id="s-tail", value="N215NV",
-                                         placeholder="e.g. N215NV", size="sm")),
-                        _field("Date  (YYYY-MM-DD)",
-                               dbc.Input(id="s-date", placeholder="e.g. 2019-03-14",
-                                         size="sm")),
-                        _field("Origin  (optional)",
-                               dbc.Input(id="s-orig-tail",
-                                         placeholder="e.g. RDM", size="sm")),
-                        _field("Dest  (optional)",
-                               dbc.Input(id="s-dest-tail",
-                                         placeholder="e.g. AZA", size="sm")),
+                               _dd("dd-tail", _opts(INITIAL_TAILS),
+                                   placeholder="Pick a tail number…")),
+                        _field("Date",
+                               _dd("dd-date-tail", _opts(INITIAL_DATES),
+                                   placeholder="Pick a date…")),
+                        _field("Origin",
+                               _dd("dd-orig-tail", _opts(INITIAL_ORIGINS),
+                                   placeholder="Any origin")),
+                        _field("Destination",
+                               _dd("dd-dest-tail", _opts(INITIAL_DESTS),
+                                   placeholder="Any destination")),
                     ]),
                 ]),
 
                 # Flight number panel
-                html.Div(id="panel-fnum", style={"display":"none"}, children=[
-                    html.P("Use the airline flight number (e.g. 552, 2684).",
-                           className="text-muted small mb-2"),
+                html.Div(id="panel-fnum", style={"display": "none"}, children=[
                     dbc.Row([
                         _field("Flight number",
-                               dbc.Input(id="s-fnum",
-                                         placeholder="e.g. 552", size="sm")),
-                        _field("Date  (optional)",
-                               dbc.Input(id="s-date-fnum",
-                                         placeholder="e.g. 2019-03-14", size="sm")),
-                        _field("Origin  (optional)",
-                               dbc.Input(id="s-orig-fnum",
-                                         placeholder="e.g. AZA", size="sm")),
-                        _field("Dest  (optional)",
-                               dbc.Input(id="s-dest-fnum",
-                                         placeholder="e.g. SBN", size="sm")),
+                               _dd("dd-fnum", _opts(INITIAL_FNUMS),
+                                   placeholder="Pick a flight number…")),
+                        _field("Date",
+                               _dd("dd-date-fnum", _opts(INITIAL_DATES),
+                                   placeholder="Pick a date…")),
+                        _field("Origin",
+                               _dd("dd-orig-fnum", _opts(INITIAL_ORIGINS),
+                                   placeholder="Any origin")),
+                        _field("Destination",
+                               _dd("dd-dest-fnum", _opts(INITIAL_DESTS),
+                                   placeholder="Any destination")),
                     ]),
                 ]),
             ]),
         ], className="mb-3 shadow-sm"),
 
-        # ── Model ─────────────────────────────────────────────────────
         dbc.Card([
             dbc.CardHeader(html.B("Model")),
             dbc.CardBody([
                 _lbl("Select model"),
-                _sel("model-select", model_opts, model_opts[0]["value"]),
+                _dd("model-select", model_opts, val=model_opts[0]["value"], clearable=False),
                 html.Br(),
                 _lbl("Decision threshold"),
                 dcc.Slider(
                     id="thresh-slider", min=0.1, max=0.9, step=0.05,
                     value=DEFAULT_THRESHOLD,
-                    marks={v/10: f"{v/10:.1f}" for v in range(1, 10)},
+                    marks={v / 10: f"{v / 10:.1f}" for v in range(1, 10)},
                     tooltip={"placement": "bottom", "always_visible": True},
                 ),
             ]),
@@ -200,7 +234,8 @@ app.layout = dbc.Container([
                 className="fw-bold mt-4 mb-1"),
         html.P(
             f"{DATA_FILE.name}  ·  "
-            + (f"{_DF.height:,} flights ready" if _DF is not None else "data not loaded")
+            + (f"{_DF.height:,} flights ready (Nov)"
+               if _DF is not None else "data not loaded")
             + f"  ·  {n_models} model{'s' if n_models != 1 else ''} available",
             className="text-muted small mb-4",
         ),
@@ -211,8 +246,8 @@ app.layout = dbc.Container([
             html.Div(id="report-panel", children=[
                 dbc.Alert(
                     [html.B("Ready.  "),
-                     "Default: tail N215NV on route RDM → AZA.  "
-                     "Enter a date and click Run prediction."],
+                     "Pick a tail number from the dropdown — the other fields will narrow "
+                     "to match. Then click Run prediction."],
                     color="secondary", className="mt-4",
                 )
             ]),
@@ -238,6 +273,120 @@ def _toggle_panels(tab):
 
 
 # ---------------------------------------------------------------------------
+# Cascading dropdowns — TAIL MODE
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("dd-date-tail", "options"),
+    Output("dd-date-tail", "value"),
+    Output("dd-orig-tail", "options"),
+    Output("dd-orig-tail", "value"),
+    Output("dd-dest-tail", "options"),
+    Output("dd-dest-tail", "value"),
+    Input("dd-tail",      "value"),
+    Input("dd-date-tail", "value"),
+    Input("dd-orig-tail", "value"),
+    State("dd-dest-tail", "value"),
+    prevent_initial_call=True,
+)
+def _cascade_tail(tail, date, origin, dest):
+    """When tail/date/origin change, narrow the downstream dropdowns."""
+    try:
+        if _INDEX is None or not tail:
+            return (
+                _opts(INITIAL_DATES),   None,
+                _opts(INITIAL_ORIGINS), None,
+                _opts(INITIAL_DESTS),   None,
+            )
+
+        trigger = callback_context.triggered_id
+
+        if trigger == "dd-tail":
+            date = origin = dest = None
+        elif trigger == "dd-date-tail":
+            origin = dest = None
+        elif trigger == "dd-orig-tail":
+            dest = None
+
+        opts = _INDEX.get_filter_options(
+            tail_number=tail, date=date, origin=origin,
+        )
+
+        date_val = date
+        if date_val is None and len(opts["dates"]) == 1:
+            date_val = opts["dates"][0]
+
+        return (
+            _opts(opts["dates"]),   date_val,
+            _opts(opts["origins"]), origin,
+            _opts(opts["dests"]),   dest,
+        )
+    except Exception:
+        print("[cascade-tail] ERROR:\n" + traceback.format_exc())
+        return (
+            _opts(INITIAL_DATES),   None,
+            _opts(INITIAL_ORIGINS), None,
+            _opts(INITIAL_DESTS),   None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cascading dropdowns — FLIGHT NUMBER MODE
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("dd-date-fnum", "options"),
+    Output("dd-date-fnum", "value"),
+    Output("dd-orig-fnum", "options"),
+    Output("dd-orig-fnum", "value"),
+    Output("dd-dest-fnum", "options"),
+    Output("dd-dest-fnum", "value"),
+    Input("dd-fnum",      "value"),
+    Input("dd-date-fnum", "value"),
+    Input("dd-orig-fnum", "value"),
+    State("dd-dest-fnum", "value"),
+    prevent_initial_call=True,
+)
+def _cascade_fnum(fnum, date, origin, dest):
+    try:
+        if _INDEX is None or not fnum:
+            return (
+                _opts(INITIAL_DATES),   None,
+                _opts(INITIAL_ORIGINS), None,
+                _opts(INITIAL_DESTS),   None,
+            )
+
+        trigger = callback_context.triggered_id
+        if trigger == "dd-fnum":
+            date = origin = dest = None
+        elif trigger == "dd-date-fnum":
+            origin = dest = None
+        elif trigger == "dd-orig-fnum":
+            dest = None
+
+        opts = _INDEX.get_filter_options(
+            flight_number=fnum, date=date, origin=origin,
+        )
+
+        date_val = date
+        if date_val is None and len(opts["dates"]) == 1:
+            date_val = opts["dates"][0]
+
+        return (
+            _opts(opts["dates"]),   date_val,
+            _opts(opts["origins"]), origin,
+            _opts(opts["dests"]),   dest,
+        )
+    except Exception:
+        print("[cascade-fnum] ERROR:\n" + traceback.format_exc())
+        return (
+            _opts(INITIAL_DATES),   None,
+            _opts(INITIAL_ORIGINS), None,
+            _opts(INITIAL_DESTS),   None,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Callback: run prediction
 # ---------------------------------------------------------------------------
 
@@ -246,17 +395,14 @@ def _toggle_panels(tab):
     Output("run-error",    "children"),
     Input("run-btn",       "n_clicks"),
     State("search-tabs",   "active_tab"),
-    # Tail mode
-    State("s-tail",        "value"),
-    State("s-date",        "value"),
-    State("s-orig-tail",   "value"),
-    State("s-dest-tail",   "value"),
-    # Flight number mode
-    State("s-fnum",        "value"),
-    State("s-date-fnum",   "value"),
-    State("s-orig-fnum",   "value"),
-    State("s-dest-fnum",   "value"),
-    # Model
+    State("dd-tail",       "value"),
+    State("dd-date-tail",  "value"),
+    State("dd-orig-tail",  "value"),
+    State("dd-dest-tail",  "value"),
+    State("dd-fnum",       "value"),
+    State("dd-date-fnum",  "value"),
+    State("dd-orig-fnum",  "value"),
+    State("dd-dest-fnum",  "value"),
     State("model-select",  "value"),
     State("thresh-slider", "value"),
     prevent_initial_call=True,
@@ -271,7 +417,7 @@ def run_prediction(
         body = [html.B(msg)]
         if detail:
             body.append(html.Pre(detail, className="small mt-1 mb-0"))
-        return dash.no_update, dbc.Alert(body, color="danger", className="p-2")
+        return no_update, dbc.Alert(body, color="danger", className="p-2")
 
     if _DF is None or _INDEX is None:
         return _err("Data not loaded.", _LOAD_ERROR)
@@ -280,11 +426,10 @@ def run_prediction(
 
     threshold = float(threshold or DEFAULT_THRESHOLD)
 
-    # ── Search via index ──────────────────────────────────────────────
     try:
         if active_tab == "tab-tail":
             if not s_tail:
-                return _err("Enter a tail number.")
+                return _err("Pick a tail number.")
             matches = _INDEX.search(
                 tail_number=s_tail or None,
                 date=s_date or None,
@@ -293,7 +438,7 @@ def run_prediction(
             )
         else:
             if not s_fnum:
-                return _err("Enter a flight number.")
+                return _err("Pick a flight number.")
             matches = _INDEX.search(
                 flight_number=s_fnum or None,
                 date=s_date_fnum or None,
@@ -313,12 +458,11 @@ def run_prediction(
     multi_note = (
         dbc.Alert(
             f"{len(matches):,} flights matched — showing the first. "
-            "Add date / origin / dest to narrow down.",
+            "Narrow with date / origin / dest.",
             color="info", className="mb-3",
         ) if len(matches) > 1 else None
     )
 
-    # ── Load model (cached after first call) ──────────────────────────
     models_found = discover_models(MODELS_DIR)
     if model_name not in models_found:
         return _err(f"Model '{model_name}' not found.")
@@ -330,9 +474,9 @@ def run_prediction(
     except Exception:
         return _err("Could not load model.", traceback.format_exc())
 
-    # ── Predict ───────────────────────────────────────────────────────
     try:
-        result = predict_row(row, clf, reg, threshold=threshold, model_info=models_found[model_name])
+        result = predict_row(row, clf, reg, threshold=threshold,
+                             model_info=models_found[model_name])
     except Exception:
         return _err("Prediction failed.", traceback.format_exc())
 
@@ -342,15 +486,13 @@ def run_prediction(
     features_used  = result.get("features_used", [])
     missing_cols   = result.get("missing_cols", [])
 
-    # ── Actuals ───────────────────────────────────────────────────────
-    actual_delay   = float(row.get(TARGET_REG,    0) or 0)
-    actual_del15   = int(row.get(TARGET_CLASS,    0) or 0)
-    actual_dep_del = float(row.get("dep_delay",   0) or 0)
+    actual_delay   = float(row.get(TARGET_REG, 0) or 0)
+    actual_del15   = int(row.get(TARGET_CLASS, 0) or 0)
+    actual_dep_del = float(row.get("dep_delay", 0) or 0)
     actual_verdict = "Delayed" if actual_del15 else "On time"
     cls_correct    = (pred_verdict == "Delayed") == bool(actual_del15)
 
-    # ── Propagation chain ─────────────────────────────────────────────
-    chain        = _INDEX.get_chain(row)           # fast — only touches ~20 rows
+    chain        = _INDEX.get_chain(row)
     prev2_origin = chain["prev2_origin"]
     prev2_dest   = chain["prev2_dest"]
     prev1_origin = chain["prev1_origin"]
@@ -363,18 +505,17 @@ def run_prediction(
     origin = str(row.get("origin", ""))
     dest_  = str(row.get("dest",   ""))
 
-    # ── Display metadata ──────────────────────────────────────────────
-    fid_disp   = str(row.get("flight_id", row.get("fl_num",
-                     row.get("op_carrier_fl_num", s_fnum or "—"))))
-    tail_disp  = str(row.get("tail_number", s_tail or "—"))
-    carrier    = str(row.get("op_carrier", row.get("carrier", "—")))
-    dep_date   = str(row.get("flight_date",
-                     row.get("dep_ts_actual_utc", "—")))[:10]
-    dep_hour   = row.get("dep_hour_local", "—")
-    dist_raw   = row.get("distance")
-    dist_disp  = f"{dist_raw:.0f} mi" if pd.notna(dist_raw) else "—"
+    fid_disp  = str(row.get("flight_id", row.get("fl_num",
+                    row.get("op_carrier_fl_num", s_fnum or "—"))))
+    tail_disp = str(row.get("tail_number", s_tail or "—"))
+    carrier   = str(row.get("op_carrier", row.get("carrier", "—")))
+    dep_date  = str(row.get("flight_date",
+                    row.get("dep_ts_actual_utc", "—")))[:10]
+    dep_hour  = row.get("dep_hour_local", "—")
+    dist_raw  = row.get("distance")
+    dist_disp = f"{dist_raw:.0f} mi" if pd.notna(dist_raw) else "—"
 
-    t_c  = row.get("dep_temp_c");         w_ms = row.get("dep_wind_speed_m_s")
+    t_c  = row.get("dep_temp_c"); w_ms = row.get("dep_wind_speed_m_s")
     ceil = row.get("dep_ceiling_height_m")
     weather_str = (f"{t_c:.1f}°C  ·  {w_ms:.1f} m/s  ·  ceil {ceil:.0f} m"
                    if pd.notna(t_c) else "Weather not in file")
@@ -384,7 +525,6 @@ def run_prediction(
     leg_pos    = row.get("relative_leg_position")
     cum_dep    = row.get("cum_dep_delay_aircraft_day", 0)
 
-    # ── Missing column warning ───────────────────────────────────────────
     missing_note = None
     if missing_cols:
         missing_note = dbc.Alert(
@@ -395,7 +535,6 @@ def run_prediction(
             color="warning", className="mb-3",
         )
 
-    # ── Risk tier ─────────────────────────────────────────────────────
     if pred_prob < 0.3:
         tier, tier_color, tier_badge = "Low risk",    "#1D9E75", "success"
     elif pred_prob < 0.6:
@@ -405,8 +544,6 @@ def run_prediction(
 
     reg_err   = pred_delay - actual_delay
     err_color = "#E24B4A" if abs(reg_err) > 20 else "#1D9E75"
-
-    # ── Report components ─────────────────────────────────────────────
 
     header = dbc.Card(dbc.CardBody(dbc.Row([
         dbc.Col([

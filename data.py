@@ -7,11 +7,6 @@ Memory strategy
   • In-memory store: Polars DataFrame (~800 MB for 7M rows × 63 cols)
   • Index values: numpy int32 arrays (~58 MB total)
   • Row returned to app: pandas Series (single row, trivial)
-
-Why Polars in-memory instead of pandas?
-  pandas expands the 761 MB parquet to ~3 GB in RAM (object dtypes,
-  numpy overhead). Polars keeps the same data as Arrow columnar memory
-  at ~800 MB — a 3.7x saving that keeps the 4 GB instance stable.
 """
 from __future__ import annotations
 import re, warnings
@@ -163,65 +158,127 @@ def collect_all_model_features(models_dir):
     return sorted(all_f)
 
 # ---------------------------------------------------------------------------
-# Public loader — returns Polars DataFrame (not pandas)
+# Public loader — returns Polars DataFrame
 # ---------------------------------------------------------------------------
-def load_and_engineer(parquet_path, cache_suffix="_cache", models_dir=None) -> pl.DataFrame:
+def load_and_engineer(
+    parquet_path,
+    cache_suffix: str = "_cache",
+    models_dir=None,
+    filter_month: int | None = None,
+) -> pl.DataFrame:
     """
-    Returns a Polars DataFrame kept in Arrow memory (~800 MB).
-    Never converts to pandas — that would expand to ~3 GB and OOM.
+    Returns a Polars DataFrame kept in Arrow memory.
 
-    If the raw source parquet doesn't exist but the cache does,
-    reads the cache directly — no engineering needed.
+    Path resolution logic
+    ─────────────────────
+    The caller can pass either:
+      • the RAW source path (e.g. flights_canonical_2019.parquet) — cache will be
+        flights_canonical_2019_cache.parquet
+      • the CACHE path itself (e.g. flights_canonical_2019_cache.parquet) — we
+        detect this and just read it directly. No double-suffix nonsense.
+
+    If `filter_month` is given (1-12), the data is filtered to that month
+    AFTER engineering (so lag features are still computed across the full year),
+    then re-cached to `<stem>_month<NN>.parquet` for fast subsequent loads.
     """
-    src=Path(parquet_path); cache=src.with_name(src.stem+cache_suffix+".parquet")
+    src = Path(parquet_path)
 
-    # Cache-only mode: source absent but cache present — just read it
-    if not src.exists() and cache.exists():
-        print(f"[cache] Source not found — reading existing {cache.name} …")
-        df=pl.read_parquet(cache)
+    # ── 1. Resolve whether caller already pointed at a cache file ─────────────
+    is_cache_path = src.stem.endswith(cache_suffix)
+    if is_cache_path:
+        cache = src                                                    # already a cache
+    else:
+        cache = src.with_name(src.stem + cache_suffix + ".parquet")
+
+    # ── 2. Month-specific cache (separate from year cache) ────────────────────
+    if filter_month is not None:
+        month_cache = cache.with_name(
+            cache.stem.replace(cache_suffix, "") + f"_month{filter_month:02d}.parquet"
+        )
+    else:
+        month_cache = None
+
+    # Fast path: month cache exists → read it directly
+    if month_cache is not None and month_cache.exists():
+        print(f"[cache] Reading month cache {month_cache.name} …")
+        df = pl.read_parquet(month_cache)
         print(f"[cache] {df.height:,} rows · {df.width} cols · ~{df.estimated_size('mb'):.0f} MB in RAM")
         return df
 
-    if cache.exists() and cache.stat().st_mtime>=src.stat().st_mtime:
+    # ── 3. Load the engineered dataset (cache or raw) ─────────────────────────
+    if is_cache_path:
+        # Caller pointed straight at the cache — just read it
+        if not src.exists():
+            raise FileNotFoundError(
+                f"Cache file does not exist: {src}\n"
+                f"Either provide the raw source parquet, or check the path."
+            )
+        print(f"[cache] Reading pre-built cache {src.name} …")
+        df = pl.read_parquet(src)
+        print(f"[cache] {df.height:,} rows · {df.width} cols · ~{df.estimated_size('mb'):.0f} MB in RAM")
+    elif cache.exists() and (not src.exists() or cache.stat().st_mtime >= src.stat().st_mtime):
+        # Cache is fresh (or source is gone but cache exists)
         print(f"[cache] Reading {cache.name} …")
-        df=pl.read_parquet(cache)
+        df = pl.read_parquet(cache)
         print(f"[cache] {df.height:,} rows · {df.width} cols · ~{df.estimated_size('mb'):.0f} MB in RAM")
-        return df
-    print(f"[cache] Processing {src.name} with Polars …")
-    df=pl.read_parquet(src)
-    print(f"[raw]   {df.height:,} rows × {df.width} cols")
-    df=df.rename({c:_clean_col(c) for c in df.columns})
-    if "is_cancelled" in df.columns: df=df.filter(pl.col("is_cancelled")==0)
-    if "is_diverted"  in df.columns: df=df.filter(pl.col("is_diverted")==0)
-    if TARGET_CLASS   in df.columns: df=df.filter(pl.col(TARGET_CLASS).is_not_null())
-    print(f"[raw]   {df.height:,} rows after filter")
-    for col in ("dep_ts_actual_utc","arr_ts_actual_utc"):
-        if col in df.columns:
-            try: df=df.with_columns(pl.col(col).cast(pl.Datetime("us","UTC")))
-            except: pass
-    df=_engineer_polars(df)
-    extra=collect_all_model_features(models_dir) if models_dir else []
-    all_needed=set(XGB_FULL_FEATURES)|set(extra)
-    fill=[pl.lit(0.0).cast(pl.Float32).alias(c) for c in all_needed if c not in df.columns]
-    if fill: df=df.with_columns(fill)
-    for col in all_needed:
-        if col in df.columns and df[col].null_count()>0:
-            med=df[col].median()
-            df=df.with_columns(pl.col(col).fill_null(med if med is not None else 0).cast(pl.Float32))
-    keep=[c for c in df.columns if c in (set(_IDENTITY_COLS)|all_needed)]
-    print(f"  [slim] Keeping {len(keep)} cols, dropping {df.width-len(keep)} unused")
-    df=df.select(keep)
-    print(f"[cache] Writing {cache.name} …")
-    df.write_parquet(cache,compression="snappy")
-    print(f"[cache] Written ({cache.stat().st_size/1e6:.0f} MB) — {df.height:,} rows × {df.width} cols.")
+    else:
+        # Build engineered cache from raw source
+        if not src.exists():
+            raise FileNotFoundError(
+                f"Neither source ({src}) nor cache ({cache}) exists.\n"
+                f"Place your parquet file at one of those paths and try again."
+            )
+        print(f"[cache] Processing {src.name} with Polars …")
+        df = pl.read_parquet(src)
+        print(f"[raw]   {df.height:,} rows × {df.width} cols")
+        df = df.rename({c: _clean_col(c) for c in df.columns})
+        if "is_cancelled" in df.columns: df = df.filter(pl.col("is_cancelled") == 0)
+        if "is_diverted"  in df.columns: df = df.filter(pl.col("is_diverted")  == 0)
+        if TARGET_CLASS   in df.columns: df = df.filter(pl.col(TARGET_CLASS).is_not_null())
+        print(f"[raw]   {df.height:,} rows after filter")
+        for col in ("dep_ts_actual_utc", "arr_ts_actual_utc"):
+            if col in df.columns:
+                try: df = df.with_columns(pl.col(col).cast(pl.Datetime("us", "UTC")))
+                except: pass
+        df = _engineer_polars(df)
+        extra = collect_all_model_features(models_dir) if models_dir else []
+        all_needed = set(XGB_FULL_FEATURES) | set(extra)
+        fill = [pl.lit(0.0).cast(pl.Float32).alias(c) for c in all_needed if c not in df.columns]
+        if fill: df = df.with_columns(fill)
+        for col in all_needed:
+            if col in df.columns and df[col].null_count() > 0:
+                med = df[col].median()
+                df = df.with_columns(pl.col(col).fill_null(med if med is not None else 0).cast(pl.Float32))
+        keep = [c for c in df.columns if c in (set(_IDENTITY_COLS) | all_needed)]
+        print(f"  [slim] Keeping {len(keep)} cols, dropping {df.width - len(keep)} unused")
+        df = df.select(keep)
+        print(f"[cache] Writing {cache.name} …")
+        df.write_parquet(cache, compression="snappy")
+        print(f"[cache] Written ({cache.stat().st_size / 1e6:.0f} MB) — {df.height:,} rows × {df.width} cols.")
+
+    # ── 4. Apply month filter (after engineering, so lags are intact) ─────────
+    if filter_month is not None:
+        if "flight_date" in df.columns:
+            before = df.height
+            # Ensure flight_date is a Date dtype
+            if df["flight_date"].dtype != pl.Date:
+                df = df.with_columns(pl.col("flight_date").cast(pl.Date))
+            df = df.filter(pl.col("flight_date").dt.month() == filter_month)
+            print(f"[filter] Month {filter_month}: {df.height:,} of {before:,} rows kept")
+            if df.height > 0 and month_cache is not None:
+                print(f"[cache] Writing month cache {month_cache.name} …")
+                df.write_parquet(month_cache, compression="snappy")
+        else:
+            print(f"[filter] WARNING: no 'flight_date' column — month filter skipped")
+
     return df
 
 # ---------------------------------------------------------------------------
-# FlightIndex — builds on Polars, returns pandas Series per row
+# FlightIndex
 # ---------------------------------------------------------------------------
 class FlightIndex:
     def __init__(self, df: pl.DataFrame) -> None:
-        self._df = df   # Polars — stays in Arrow memory
+        self._df = df
 
         print("[index] Building tail-number index …")
         self.tail_index: dict[str, np.ndarray] = {}
@@ -229,30 +286,181 @@ class FlightIndex:
             _tmp: dict[str, list] = {}
             for pos, val in enumerate(df["tail_number"].cast(pl.Utf8).to_list()):
                 _tmp.setdefault((val or "").upper(), []).append(pos)
-            self.tail_index = {k: np.array(v, dtype=np.int32) for k,v in _tmp.items()}
+            self.tail_index = {k: np.array(v, dtype=np.int32) for k, v in _tmp.items() if k}
             del _tmp
 
         print("[index] Building flight-number index …")
         self.flight_index: dict[str, np.ndarray] = {}
-        for col in ("flight_number_reporting_airline","flight_number","fl_num","op_carrier_fl_num"):
+        self._flight_number_col: str | None = None
+        for col in ("flight_number_reporting_airline", "flight_number", "fl_num", "op_carrier_fl_num"):
             if col in df.columns:
                 print(f"[index] Flight number column: '{col}'")
+                self._flight_number_col = col
                 _tmp2: dict[str, list] = {}
                 for pos, val in enumerate(df[col].cast(pl.Utf8).to_list()):
                     v = (val or "").strip()
+                    if not v: continue
                     _tmp2.setdefault(v, []).append(pos)
                     s = v.lstrip("0")
                     if s and s != v: _tmp2.setdefault(s, []).append(pos)
-                self.flight_index = {k: np.array(v, dtype=np.int32) for k,v in _tmp2.items()}
+                self.flight_index = {k: np.array(v, dtype=np.int32) for k, v in _tmp2.items()}
                 del _tmp2
                 break
 
         print(f"[index] {len(self.tail_index):,} tails | {len(self.flight_index):,} flight numbers — ready.")
 
     def _rows_to_df(self, positions: np.ndarray) -> pd.DataFrame:
-        """Fetch rows by position from Polars and return as pandas DataFrame."""
         return self._df[positions.tolist()].to_pandas()
 
+    # ── Dropdown helpers ──────────────────────────────────────────────────────
+    def all_tails(self, limit: int = 2000) -> list[str]:
+        """Return sorted list of all tail numbers (capped for UI responsiveness)."""
+        tails = sorted(k for k in self.tail_index.keys() if k and k != "NAN")
+        return tails[:limit]
+
+    def all_flight_numbers(self, limit: int = 2000) -> list[str]:
+        """Sorted unique flight numbers (no leading-zero duplicates)."""
+        seen, out = set(), []
+        for k in self.flight_index.keys():
+            if not k: continue
+            stripped = k.lstrip("0") or k
+            if stripped in seen: continue
+            seen.add(stripped); out.append(stripped)
+        try:
+            out.sort(key=lambda x: (len(x), x))
+        except Exception:
+            out.sort()
+        return out[:limit]
+
+    def get_filter_options(
+        self,
+        tail_number: str | None = None,
+        flight_number: str | None = None,
+        date: str | None = None,
+        origin: str | None = None,
+        dest: str | None = None,
+    ) -> dict:
+        """
+        Given any combination of already-selected fields, return the set of
+        valid values for every other field. Powers the cascading dropdowns.
+
+        Returns: {"tails":[...], "flight_numbers":[...], "dates":[...],
+                  "origins":[...], "dests":[...]}
+        """
+        # Start with the positions implied by the strongest filter we have
+        positions: np.ndarray | None = None
+
+        if tail_number:
+            positions = self.tail_index.get(tail_number.strip().upper())
+        elif flight_number:
+            fn = str(flight_number).strip()
+            # NOTE: must not use `a or b` here — numpy arrays of length > 1
+            # raise ValueError on truthiness checks.
+            positions = self.flight_index.get(fn)
+            if positions is None or len(positions) == 0:
+                positions = self.flight_index.get(fn.lstrip("0"))
+
+        if positions is None or len(positions) == 0:
+            # No anchor — pull options from the full dataset (capped)
+            return {
+                "tails":          self.all_tails(),
+                "flight_numbers": self.all_flight_numbers(),
+                "dates":          self._all_dates(limit=500),
+                "origins":        self._distinct("origin"),
+                "dests":          self._distinct("dest"),
+            }
+
+        sub = self._rows_to_df(positions)
+
+        # Apply secondary filters
+        try:
+            if date and "flight_date" in sub.columns:
+                d = _parse_date(date)
+                if d is not None:
+                    sub = sub[sub["flight_date"].apply(
+                        lambda x: x.date() if hasattr(x, "date") else x
+                    ) == d]
+            if origin and "origin" in sub.columns:
+                sub = sub[sub["origin"].astype(str).str.upper() == origin.strip().upper()]
+            if dest and "dest" in sub.columns:
+                sub = sub[sub["dest"].astype(str).str.upper() == dest.strip().upper()]
+        except Exception as e:
+            print(f"[index] WARN: secondary filter failed ({e}) — using unfiltered subset")
+
+        # Build the options from the filtered subset
+        def _col_unique(col: str) -> list[str]:
+            if col not in sub.columns:
+                return []
+            try:
+                vals = sub[col].dropna().astype(str).str.strip()
+                vals = vals[vals != ""].unique().tolist()
+                try:    vals.sort()
+                except Exception: pass
+                return vals
+            except Exception as e:
+                print(f"[index] WARN: _col_unique({col}) failed: {e}")
+                return []
+
+        dates: list[str] = []
+        if "flight_date" in sub.columns:
+            try:
+                d_series = sub["flight_date"].dropna()
+                d_strs = set()
+                for v in d_series:
+                    try:
+                        d_strs.add((v.date() if hasattr(v, "date") else v).isoformat())
+                    except Exception:
+                        d_strs.add(str(v)[:10])
+                dates = sorted(d_strs)
+            except Exception as e:
+                print(f"[index] WARN: building dates failed: {e}")
+
+        flight_nums: list[str] = []
+        if self._flight_number_col and self._flight_number_col in sub.columns:
+            try:
+                raw = sub[self._flight_number_col].dropna().astype(str).str.strip()
+                raw = raw[raw != ""].apply(lambda x: x.lstrip("0") or x).unique().tolist()
+                try:    raw.sort(key=lambda x: (len(x), x))
+                except Exception: raw.sort()
+                flight_nums = raw
+            except Exception as e:
+                print(f"[index] WARN: building flight_nums failed: {e}")
+
+        tails: list[str] = []
+        if "tail_number" in sub.columns:
+            try:
+                tails = sorted(
+                    sub["tail_number"].dropna().astype(str).str.upper().unique().tolist()
+                )
+            except Exception as e:
+                print(f"[index] WARN: building tails failed: {e}")
+
+        return {
+            "tails":          tails or self.all_tails(),
+            "flight_numbers": flight_nums or self.all_flight_numbers(),
+            "dates":          dates,
+            "origins":        _col_unique("origin"),
+            "dests":          _col_unique("dest"),
+        }
+
+    def _all_dates(self, limit: int = 500) -> list[str]:
+        if "flight_date" not in self._df.columns: return []
+        dates = self._df["flight_date"].unique().to_list()
+        out = set()
+        for v in dates:
+            if v is None: continue
+            try: out.add((v.date() if hasattr(v, "date") else v).isoformat())
+            except Exception: out.add(str(v)[:10])
+        return sorted(out)[:limit]
+
+    def _distinct(self, col: str) -> list[str]:
+        if col not in self._df.columns: return []
+        try:
+            return sorted(v for v in self._df[col].unique().to_list() if v)
+        except Exception:
+            return []
+
+    # ── Search (returns pandas DataFrame of matches) ─────────────────────────
     def search(self, tail_number=None, date=None, flight_number=None, origin=None, dest=None) -> pd.DataFrame:
         if tail_number:
             pos = self.tail_index.get(tail_number.strip().upper(), np.array([], dtype=np.int32))
@@ -262,7 +470,7 @@ class FlightIndex:
             raw = str(flight_number).strip().split()[-1]
             _p1 = self.flight_index.get(raw, None)
             _p2 = self.flight_index.get(raw.lstrip("0"), None)
-            pos  = _p1 if (_p1 is not None and len(_p1) > 0) else _p2
+            pos = _p1 if (_p1 is not None and len(_p1) > 0) else _p2
             if pos is None or len(pos) == 0: return pd.DataFrame()
             sub = self._rows_to_df(pos)
         else:
@@ -271,18 +479,18 @@ class FlightIndex:
         if date:
             d = _parse_date(date)
             if d is not None and "flight_date" in sub.columns:
-                sub = sub[sub["flight_date"].apply(lambda x: x.date() if hasattr(x,"date") else x) == d]
-        if origin: sub = sub[sub["origin"].str.upper() == origin.strip().upper()]
-        if dest:   sub = sub[sub["dest"].str.upper()   == dest.strip().upper()]
+                sub = sub[sub["flight_date"].apply(lambda x: x.date() if hasattr(x, "date") else x) == d]
+        if origin: sub = sub[sub["origin"].astype(str).str.upper() == origin.strip().upper()]
+        if dest:   sub = sub[sub["dest"].astype(str).str.upper()   == dest.strip().upper()]
         return sub.reset_index(drop=True)
 
     def get_chain(self, row: pd.Series) -> dict:
-        out = {"prev2_origin":"","prev2_dest":"","prev1_origin":"","prev1_dest":""}
-        p_orig = str(row.get("prev_origin","") or "")
-        p_dest = str(row.get("prev_dest","")   or "")
-        if p_orig and p_orig not in ("nan","None",""):
+        out = {"prev2_origin": "", "prev2_dest": "", "prev1_origin": "", "prev1_dest": ""}
+        p_orig = str(row.get("prev_origin", "") or "")
+        p_dest = str(row.get("prev_dest", "")   or "")
+        if p_orig and p_orig not in ("nan", "None", ""):
             out["prev1_origin"] = p_orig; out["prev1_dest"] = p_dest
-            tail   = str(row.get("tail_number","")).upper()
+            tail   = str(row.get("tail_number", "")).upper()
             dep_ts = row.get("dep_ts_actual_utc")
             if tail and pd.notna(dep_ts):
                 pos = self.tail_index.get(tail, np.array([], dtype=np.int32))
@@ -292,11 +500,11 @@ class FlightIndex:
                         bef = tdf[tdf["dep_ts_actual_utc"] < dep_ts]
                         if len(bef) >= 1:
                             pr  = bef.iloc[-1]
-                            p2o = str(pr.get("prev_origin","") or "")
-                            p2d = str(pr.get("prev_dest","")   or "")
-                            if p2o not in ("nan","None",""): out["prev2_origin"]=p2o; out["prev2_dest"]=p2d
+                            p2o = str(pr.get("prev_origin", "") or "")
+                            p2d = str(pr.get("prev_dest", "")   or "")
+                            if p2o not in ("nan", "None", ""): out["prev2_origin"] = p2o; out["prev2_dest"] = p2d
             return out
-        tail   = str(row.get("tail_number","")).upper()
+        tail   = str(row.get("tail_number", "")).upper()
         dep_ts = row.get("dep_ts_actual_utc")
         if not tail or pd.isna(dep_ts): return out
         pos = self.tail_index.get(tail, np.array([], dtype=np.int32))
@@ -304,38 +512,38 @@ class FlightIndex:
         tdf = self._rows_to_df(pos)
         if "dep_ts_actual_utc" not in tdf.columns: return out
         bef = tdf[tdf["dep_ts_actual_utc"] < dep_ts]
-        if len(bef) >= 1: p1=bef.iloc[-1]; out["prev1_origin"]=str(p1.get("origin","")); out["prev1_dest"]=str(p1.get("dest",""))
-        if len(bef) >= 2: p2=bef.iloc[-2]; out["prev2_origin"]=str(p2.get("origin","")); out["prev2_dest"]=str(p2.get("dest",""))
+        if len(bef) >= 1: p1 = bef.iloc[-1]; out["prev1_origin"] = str(p1.get("origin", "")); out["prev1_dest"] = str(p1.get("dest", ""))
+        if len(bef) >= 2: p2 = bef.iloc[-2]; out["prev2_origin"] = str(p2.get("origin", "")); out["prev2_dest"] = str(p2.get("dest", ""))
         return out
 
 # ---------------------------------------------------------------------------
-# Legacy wrappers
+# Legacy wrappers (unchanged)
 # ---------------------------------------------------------------------------
-def find_flight(df,flight_id=None,tail_number=None,origin=None,dest=None):
+def find_flight(df, flight_id=None, tail_number=None, origin=None, dest=None):
     if isinstance(df, pl.DataFrame): df = df.to_pandas()
-    r=df
+    r = df
     if flight_id:
-        fid=str(flight_id).strip().upper()
-        for col in ("flight_id","fl_num","op_carrier_fl_num"):
+        fid = str(flight_id).strip().upper()
+        for col in ("flight_id", "fl_num", "op_carrier_fl_num"):
             if col in r.columns:
-                mask=r[col].astype(str).str.strip().str.upper()==fid
-                if mask.any(): r=r[mask]; break
+                mask = r[col].astype(str).str.strip().str.upper() == fid
+                if mask.any(): r = r[mask]; break
     if tail_number:
-        tn=str(tail_number).strip().upper()
-        for col in ("tail_number","tail_num"):
-            if col in r.columns: r=r[r[col].astype(str).str.strip().str.upper()==tn]; break
-    if origin: r=r[r["origin"].astype(str).str.upper()==origin.strip().upper()]
-    if dest:   r=r[r["dest"].astype(str).str.upper()==dest.strip().upper()]
+        tn = str(tail_number).strip().upper()
+        for col in ("tail_number", "tail_num"):
+            if col in r.columns: r = r[r[col].astype(str).str.strip().str.upper() == tn]; break
+    if origin: r = r[r["origin"].astype(str).str.upper() == origin.strip().upper()]
+    if dest:   r = r[r["dest"].astype(str).str.upper()   == dest.strip().upper()]
     return r.reset_index(drop=True)
 
-def get_propagation_chain(df,row):
+def get_propagation_chain(df, row):
     if isinstance(df, pl.DataFrame): df = df.to_pandas()
-    chain={"prev2_origin":"","prev2_dest":"","prev1_origin":"","prev1_dest":""}
+    chain = {"prev2_origin": "", "prev2_dest": "", "prev1_origin": "", "prev1_dest": ""}
     if "tail_number" not in df.columns or "dep_ts_actual_utc" not in df.columns: return chain
-    tail=row.get("tail_number",""); dep_ts=row.get("dep_ts_actual_utc")
+    tail = row.get("tail_number", ""); dep_ts = row.get("dep_ts_actual_utc")
     if not tail or pd.isna(dep_ts): return chain
-    tdf=df[df["tail_number"]==tail].sort_values("dep_ts_actual_utc")
-    bef=tdf[tdf["dep_ts_actual_utc"]<dep_ts]
-    if len(bef)>=1: p1=bef.iloc[-1]; chain["prev1_origin"]=str(p1.get("origin","")); chain["prev1_dest"]=str(p1.get("dest",""))
-    if len(bef)>=2: p2=bef.iloc[-2]; chain["prev2_origin"]=str(p2.get("origin","")); chain["prev2_dest"]=str(p2.get("dest",""))
+    tdf = df[df["tail_number"] == tail].sort_values("dep_ts_actual_utc")
+    bef = tdf[tdf["dep_ts_actual_utc"] < dep_ts]
+    if len(bef) >= 1: p1 = bef.iloc[-1]; chain["prev1_origin"] = str(p1.get("origin", "")); chain["prev1_dest"] = str(p1.get("dest", ""))
+    if len(bef) >= 2: p2 = bef.iloc[-2]; chain["prev2_origin"] = str(p2.get("origin", "")); chain["prev2_dest"] = str(p2.get("dest", ""))
     return chain
